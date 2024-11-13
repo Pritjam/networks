@@ -284,7 +284,7 @@ def start_receiver(ip: str, port: int):
         server_socket.bind((ip, port))
 
         while True:
-            # print("======= Waiting =======")
+            print("======= Waiting =======")
             data, addr = server_socket.recvfrom(packet_size)
             if addr not in receivers:
                 outfile = None  # open(f'rcvd-{addr[0]}-{addr[1]}', 'w')
