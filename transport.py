@@ -3,6 +3,9 @@ import json
 from typing import Dict, List, Optional, Tuple
 import random
 import socket
+import time
+
+ALPHA = 0.7
 
 
 # Note: In this starter code, we annotate types where
@@ -10,10 +13,10 @@ import socket
 # course, we recommend it since it makes programming easier.
 
 # The maximum size of the data contained within one packet
-payload_size = 1200
+PAYLOAD_SIZE = 1200
 
 # The maximum size of a packet including all the JSON formatting
-packet_size = 1500
+PACKET_SIZE = 1500
 
 
 class Receiver:
@@ -88,21 +91,30 @@ class Receiver:
                 ):
                     break
                 # if incoming packet belongs in between this packet and the next
-                if seq_range[0] >= self.acknowledged[i][1] and seq_range[1] <= self.acknowledged[i+1][0]:
+                if (
+                    seq_range[0] >= self.acknowledged[i][1]
+                    and seq_range[1] <= self.acknowledged[i + 1][0]
+                ):
                     self.buffer.append((seq_range, data))
                     # full coalesce
-                    if seq_range[0] == self.acknowledged[i][1] and seq_range[1] == self.acknowledged[i+1][0]:
+                    if (
+                        seq_range[0] == self.acknowledged[i][1]
+                        and seq_range[1] == self.acknowledged[i + 1][0]
+                    ):
                         temp = self.acknowledged.pop(i + 1)
                         self.acknowledged[i] = (self.acknowledged[i][0], temp[1])
                     # coalesce with prev
                     elif seq_range[0] == self.acknowledged[i][1]:
                         self.acknowledged[i] = (self.acknowledged[i][0], seq_range[1])
                     # coalesce w next
-                    elif seq_range[1] == self.acknowledged[i+1][0]:
-                        self.acknowledged[i+1] = (seq_range[0], self.acknowledged[i+1][1])
+                    elif seq_range[1] == self.acknowledged[i + 1][0]:
+                        self.acknowledged[i + 1] = (
+                            seq_range[0],
+                            self.acknowledged[i + 1][1],
+                        )
                     # no coalescing, just an insert
                     else:
-                        self.acknowledged.insert(i+1, seq_range)
+                        self.acknowledged.insert(i + 1, seq_range)
                     break
 
         # now that we've handled adding this packet to the ack list, we need to see if there's any data to return
@@ -153,8 +165,16 @@ class Sender:
         #   dupacks is the number of ACKs where that packet hasn't been ack'd
         self.inflight_packets = {}
 
-        # mapping from packet_id -> {"in_flight" : false, "seq_range": (0, 1000), "sent_time" : 0.0, "ack_time": 1.0}
-        # self.packet_tracker = dict()
+        # mapping from packet_id -> send_time
+        self.packet_send_times = dict()
+
+        self.rtt_avg = 0.0
+        self.rtt_var = 0.0
+
+        self.rtt_quality_counter = 0
+
+        self.lost_packets = False
+        self.cwnd = PACKET_SIZE
 
         # sorted list of chunks that need to be sent still.
         self.send_queue = [(0, data_len)]
@@ -167,12 +187,11 @@ class Sender:
         # Here, we assume that every packet that is in-flight is dropped.
         # Notice that in start_sender, their inflight is reset to 0.
         # This implies that every inflight packet needs to be resent.
-        
 
         # every packet that's in-flight is assumed lost
         for packet in self.inflight_packets:
             self.send_queue.append(packet)
-        
+
         self.send_queue.sort(key=lambda x: x[0])
         self.inflight_packets = {}
 
@@ -188,6 +207,14 @@ class Sender:
 
         """
         ret = 0
+        this_rtt = (
+            time.monotonic()
+            - self.packet_send_times[packet_id]
+        )
+        self.packet_send_times.pop(packet_id)
+        self.rtt_avg = ALPHA * this_rtt + (1 - ALPHA) * self.rtt_avg
+        self.rtt_var = ALPHA * abs(this_rtt - self.rtt_avg) + (1 - ALPHA) * self.rtt_var
+        self.rtt_quality_counter += 1
         # for each in-flight packet, see if it is now ack'd or dropped
         counter = len(self.inflight_packets)
         for packet in sorted(self.inflight_packets.keys(), key=lambda x: x[0]):
@@ -206,11 +233,12 @@ class Sender:
                 if self.inflight_packets[packet] > 2:
                     # 3 dupacks means probably lost packet, add back to send queue
                     # print("=====Assuming packet is dropped: ", packet)
+                    self.lost_packets = True
                     self.inflight_packets.pop(packet)
                     self.send_queue.append(packet)
                     self.send_queue.sort(key=lambda x: x[0])
                     ret += packet[1] - packet[0]
-        assert(counter == 0)
+        assert counter == 0
         return ret
 
     def send(self, packet_id: int) -> Optional[Tuple[int, int]]:
@@ -235,14 +263,26 @@ class Sender:
         to_send = self.send_queue.pop(0)
 
         # if that packet is too big, split it and keep the second half in the send queue
-        if to_send[1] - to_send[0] > payload_size:
-            self.send_queue.insert(0, (to_send[0] + payload_size, to_send[1]))
-            to_send = (to_send[0], to_send[0] + payload_size)
+        if to_send[1] - to_send[0] > PAYLOAD_SIZE:
+            self.send_queue.insert(0, (to_send[0] + PAYLOAD_SIZE, to_send[1]))
+            to_send = (to_send[0], to_send[0] + PAYLOAD_SIZE)
         # now track it as in_flight
-        assert(to_send not in self.inflight_packets)
+        assert to_send not in self.inflight_packets
         self.inflight_packets[to_send] = 0
         # print(f'trying to send: {to_send}')
+        self.packet_send_times[packet_id] = time.monotonic()
         return to_send
+
+    def get_cwnd(self) -> int:
+        if self.lost_packets:
+            self.cwnd /= 2
+            self.lost_packets = False
+        else:
+            self.cwnd += 1
+        return self.cwnd
+
+    def get_rto(self) -> float:
+        return 1.0 if self.rtt_quality_counter < 5 else self.rtt_avg + 4 * self.rtt_var
 
 
 def start_receiver(ip: str, port: int):
@@ -272,9 +312,7 @@ def start_receiver(ip: str, port: int):
     constant across most machines). The Mahimahi network emulator also
     creates virtual interfaces that behave like real interfaces, but
     really only emulate a network link in software that shuttles
-    packets between different virtual interfaces. Use `ifconfig` in a
-    terminal to find out what interfaces exist in your machine or
-    inside a Mahimahi shell
+    packets between different virtual interfaces.
 
     """
 
@@ -284,11 +322,9 @@ def start_receiver(ip: str, port: int):
         server_socket.bind((ip, port))
 
         while True:
-            print("======= Waiting =======")
-            data, addr = server_socket.recvfrom(packet_size)
+            data, addr = server_socket.recvfrom(PACKET_SIZE)
             if addr not in receivers:
-                outfile = None  # open(f'rcvd-{addr[0]}-{addr[1]}', 'w')
-                receivers[addr] = (Receiver(), outfile)
+                receivers[addr] = Receiver()
 
             received = json.loads(data.decode())
             if received["type"] == "data":
@@ -303,7 +339,7 @@ def start_receiver(ip: str, port: int):
                     type(received["seq"][0]) is int and type(received["seq"][1]) is int
                 )
                 assert type(received["payload"]) is str
-                assert len(received["payload"]) <= payload_size
+                assert len(received["payload"]) <= PAYLOAD_SIZE
 
                 # Deserialize the packet. Real transport layers use
                 # more efficient and standardized ways of packing the
@@ -312,13 +348,11 @@ def start_receiver(ip: str, port: int):
                 # a byte structure given the data structure. However,
                 # for an internet standard, we usually want something
                 # more custom and hand-designed.
-                sacks, app_data = receivers[addr][0].data_packet(
+                sacks, app_data = receivers[addr].data_packet(
                     tuple(received["seq"]), received["payload"]
                 )
                 # Note: we immediately write the data to file
                 # receivers[addr][1].write(app_data)
-                # print(f"Received seq: {received['seq']}, id: {received['id']}, sending sacks: {sacks}")
-                received_data += app_data
 
                 # Send the ACK
                 server_socket.sendto(
@@ -327,35 +361,16 @@ def start_receiver(ip: str, port: int):
                     ).encode(),
                     addr,
                 )
-            elif received["type"] == "fin":
-                receivers[addr][0].finish()
-                # Check if the file is received and send fin-ack
-                if received_data:
-                    print(
-                        "received data (summary): ",
-                        received_data[:100],
-                        "...",
-                        len(received_data),
-                    )
-                    # print("received file is saved into: ", receivers[addr][1].name)
-                    # receivers[addr][1].close()
-                    server_socket.sendto(json.dumps({"type": "fin"}).encode(), addr)
-                    received_data = ""
 
+            elif received["type"] == "fin":
+                receivers[addr].finish()
                 del receivers[addr]
 
             else:
                 assert False
 
 
-def start_sender(
-    ip: str,
-    port: int,
-    data: str,
-    recv_window: int,
-    simloss: float,
-    pkts_to_reorder: int,
-):
+def start_sender(ip: str, port: int, data: str, recv_window: int, simloss: float):
     sender = Sender(len(data))
 
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client_socket:
@@ -363,7 +378,6 @@ def start_sender(
         client_socket.connect((ip, port))
         # When waiting for packets when we call receivefrom, we
         # shouldn't wait more than 500ms
-        client_socket.settimeout(0.5)
 
         # Number of bytes that we think are inflight. We are only
         # including payload bytes here, which is different from how
@@ -371,80 +385,43 @@ def start_sender(
         inflight = 0
         packet_id = 0
         wait = False
-        send_buf = []
 
         while True:
+            # Get the congestion condow
+            cwnd = sender.get_cwnd()
+
             # Do we have enough room in recv_window to send an entire
             # packet?
-            if inflight + packet_size < recv_window and not wait:
-
+            if inflight + PACKET_SIZE <= min(recv_window, cwnd) and not wait:
                 seq = sender.send(packet_id)
-                got_fin_ack = False
-                
-                # We are done sending
                 if seq is None:
-                    # print("#######send_buf#########: ", len(send_buf))
-                    if send_buf:
-                        random.shuffle(send_buf)
-                        for p in send_buf:
-                            client_socket.send(p)
-                        send_buf = []
+                    # We are done sending
                     client_socket.send('{"type": "fin"}'.encode())
-                    try:
-                        print("======= Final Waiting =======")
-                        received = client_socket.recv(packet_size)
-                        received = json.loads(received.decode())
-                        if received["type"] == "ack":
-                            client_socket.send('{"type": "fin"}'.encode())
-                            continue
-                        elif received["type"] == "fin":
-                            print(f"Got FIN-ACK")
-                            got_fin_ack = True
-                            break
-                    except socket.timeout:
-                        inflight = 0
-                        print("Timeout")
-                        sender.timeout()
-                        exit(1)
-                    if got_fin_ack:
-                        break
-                    else:
-                        continue
-
-                # No more packets to send until loss happens. Wait
+                    break
                 elif seq[1] == seq[0]:
+                    # No more packets to send until loss happens. Wait
                     wait = True
                     continue
 
-                assert seq[1] - seq[0] <= payload_size
+                assert seq[1] - seq[0] <= PAYLOAD_SIZE
                 assert seq[1] <= len(data)
-                # print(f"Sending seq: {seq}, id: {packet_id}")
 
                 # Simulate random loss before sending packets
                 if random.random() < simloss:
-                    # print("Dropped!")
                     pass
-                # else, send the packet
                 else:
-                    pkt_str = json.dumps(
-                        {
-                            "type": "data",
-                            "seq": seq,
-                            "id": packet_id,
-                            "payload": data[seq[0] : seq[1]],
-                        }
-                    ).encode()
-                    # pkts_to_reorder is a variable that bounds the maximum amount of reordering. To disable reordering, set to 1
-                    if len(send_buf) < pkts_to_reorder:
-                        send_buf += [pkt_str]
+                    # Send the packet
+                    client_socket.send(
+                        json.dumps(
+                            {
+                                "type": "data",
+                                "seq": seq,
+                                "id": packet_id,
+                                "payload": data[seq[0] : seq[1]],
+                            }
+                        ).encode()
+                    )
 
-                    if len(send_buf) == pkts_to_reorder:
-                        # Randomly shuffle send_buf
-                        random.shuffle(send_buf)
-
-                        for p in send_buf:
-                            client_socket.send(p)
-                        send_buf = []
                 inflight += seq[1] - seq[0]
                 packet_id += 1
 
@@ -452,15 +429,15 @@ def start_sender(
                 wait = False
                 # Wait for ACKs
                 try:
-                    print("======= Waiting =======")
-                    received = client_socket.recv(packet_size)
-                    received = json.loads(received.decode())
+                    rto = sender.get_rto()
+                    client_socket.settimeout(rto)
+                    received_bytes = client_socket.recv(PACKET_SIZE)
+                    received = json.loads(received_bytes.decode())
                     assert received["type"] == "ack"
 
-                    # print(f"Got ACK sacks: {received['sacks']}, id: {received['id']}")
                     if random.random() < simloss:
-                        # print("Dropped ack!")
                         continue
+
                     inflight -= sender.ack_packet(received["sacks"], received["id"])
                     assert inflight >= 0
                 except socket.timeout:
@@ -489,19 +466,13 @@ def main():
         help="If role=sender, the file that contains data to send",
     )
     parser.add_argument(
-        "--recv_window", type=int, default=15000, help="Receive window size in bytes"
+        "--recv_window", type=int, default=15000000, help="Receive window size in bytes"
     )
     parser.add_argument(
         "--simloss",
         type=float,
         default=0.0,
         help="Simulate packet loss. Provide the fraction of packets (0-1) that should be randomly dropped",
-    )
-    parser.add_argument(
-        "--pkts_to_reorder",
-        type=int,
-        default=1,
-        help="Number of packets to shuffle randomly",
     )
 
     args = parser.parse_args()
@@ -515,14 +486,7 @@ def main():
 
         with open(args.sendfile, "r") as f:
             data = f.read()
-            start_sender(
-                args.ip,
-                args.port,
-                data,
-                args.recv_window,
-                args.simloss,
-                args.pkts_to_reorder,
-            )
+            start_sender(args.ip, args.port, data, args.recv_window, args.simloss)
 
 
 if __name__ == "__main__":
