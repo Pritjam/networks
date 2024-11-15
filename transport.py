@@ -60,7 +60,7 @@ class Receiver:
         newline etc), so that terminal output can be used to debug the
         program.
         """
-
+        print("fuck")
         # handle the incoming packet
         # if it is immediately before first packet, handle that (coalesce)
         if not self.acknowledged:
