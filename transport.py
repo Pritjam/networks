@@ -168,10 +168,9 @@ class Sender:
         # mapping from packet_id -> send_time
         self.packet_send_times = dict()
 
-        self.rtt_avg = 0.0
+        self.rtt_avg = 0.1
         self.rtt_var = 0.0
 
-        self.rtt_quality_counter = 0
 
         self.lost_packets = False
         self.cwnd = PACKET_SIZE
@@ -214,7 +213,6 @@ class Sender:
         self.packet_send_times.pop(packet_id)
         self.rtt_avg = ALPHA * this_rtt + (1 - ALPHA) * self.rtt_avg
         self.rtt_var = ALPHA * abs(this_rtt - self.rtt_avg) + (1 - ALPHA) * self.rtt_var
-        self.rtt_quality_counter += 1
         # for each in-flight packet, see if it is now ack'd or dropped
         counter = len(self.inflight_packets)
         for packet in sorted(self.inflight_packets.keys(), key=lambda x: x[0]):
@@ -282,7 +280,7 @@ class Sender:
         return self.cwnd
 
     def get_rto(self) -> float:
-        return 1.0 if self.rtt_quality_counter < 5 else self.rtt_avg + 4 * self.rtt_var
+        return self.rtt_avg + 4 * self.rtt_var
 
 
 def start_receiver(ip: str, port: int):
